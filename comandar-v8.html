@@ -1003,23 +1003,29 @@ select.estado-select{padding:4px 8px;font-size:12px;border:1.5px solid var(--cre
     <div style="text-align:center;padding:10px 0 20px;">
       <div style="font-size:52px;margin-bottom:14px;">📁</div>
       <p style="font-size:13px;color:var(--gris-medio);line-height:1.6;margin-bottom:18px;">Conectá con el Google Drive del emprendimiento para sincronizar datos automáticamente desde cualquier dispositivo.</p>
-      <div class="alerta alerta-info" style="text-align:left;margin-bottom:18px;">
-        <div><strong>¿Qué se sincroniza?</strong><br>✓ Todos los datos del sistema<br>✓ Fotos de tickets organizadas por mes<br>✓ PDFs de cierre mensual automático<br>✓ Backup diario automático</div>
+
+      <!-- Botón reconectar rápido si ya hay Client ID guardado -->
+      <div id="div-reconectar" style="display:none;margin-bottom:16px;">
+        <div class="alerta alerta-success" style="margin-bottom:12px;">✓ Ya configuraste Drive antes. Podés reconectar con un solo clic.</div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center;font-size:15px;padding:12px;" onclick="reconectarRapido()">⚡ Reconectar Drive</button>
+        <div style="margin:12px 0;text-align:center;font-size:12px;color:var(--gris-claro);">— o configurar desde cero —</div>
       </div>
-      <button class="btn btn-primary" style="width:100%;justify-content:center;" onclick="mostrarInstDrive()">🔗 Conectar con Google Drive</button>
+
+      <div class="alerta alerta-info" style="text-align:left;margin-bottom:18px;">
+        <div><strong>¿Qué se sincroniza?</strong><br>✓ Todos los datos del sistema<br>✓ Fotos de tickets por mes<br>✓ Resúmenes de cierre mensual<br>✓ Backup automático diario</div>
+      </div>
+      <button class="btn btn-secondary" style="width:100%;justify-content:center;" onclick="mostrarInstDrive()">🔗 Configurar conexión nueva</button>
       <div id="drive-inst" style="display:none;margin-top:14px;">
-        <div class="alerta alerta-warn" style="text-align:left;">
-          Para conectar Drive necesitás un Client ID de Google. Si no tenés uno, pedile ayuda a alguien técnico (30 min de configuración, una sola vez).
-        </div>
+        <div class="alerta alerta-warn" style="text-align:left;">Para conectar Drive necesitás un Client ID de Google.</div>
         <div class="form-group" style="margin-top:10px;"><label>Client ID de Google OAuth</label><input type="text" id="drive-cid" placeholder="xxxx.apps.googleusercontent.com"></div>
-        <button class="btn btn-primary" onclick="conectarDrive()" style="margin-top:6px;">Conectar</button>
+        <button class="btn btn-primary" onclick="conectarDrive()" style="margin-top:6px;width:100%;justify-content:center;">Conectar</button>
       </div>
     </div>
     <div style="border-top:1px solid var(--crema-oscuro);padding-top:14px;">
-      <p style="font-size:12px;color:var(--gris-claro);margin-bottom:10px;">Mientras tanto, usá el backup manual para no perder datos:</p>
+      <p style="font-size:12px;color:var(--gris-claro);margin-bottom:10px;">Backup manual:</p>
       <div style="display:flex;gap:8px;">
-        <button class="btn btn-secondary" style="flex:1;justify-content:center;" onclick="exportarBackup();cerrarModal('modal-drive')">💾 Exportar backup ahora</button>
-        <button class="btn btn-secondary" style="flex:1;justify-content:center;" onclick="importarBackup();cerrarModal('modal-drive')">📂 Importar backup</button>
+        <button class="btn btn-secondary" style="flex:1;justify-content:center;" onclick="exportarBackup();cerrarModal('modal-drive')">💾 Exportar</button>
+        <button class="btn btn-secondary" style="flex:1;justify-content:center;" onclick="importarBackup();cerrarModal('modal-drive')">📂 Importar</button>
       </div>
     </div>
   </div>
@@ -2260,7 +2266,23 @@ function procesarImport(input){
 // ================================================================
 const DRIVE_FOLDER_NAME = 'ComandAr — Prelistas';
 
-function abrirDriveModal(){abrirModal('modal-drive');}
+function abrirDriveModal(){
+  // Mostrar botón de reconexión rápida si ya hay Client ID guardado
+  const cidGuardado=localStorage.getItem('comandar_client_id');
+  const divReconectar=document.getElementById('div-reconectar');
+  if(divReconectar) divReconectar.style.display=cidGuardado?'block':'none';
+  abrirModal('modal-drive');
+}
+
+function reconectarRapido(){
+  const cid=localStorage.getItem('comandar_client_id');
+  if(!cid){toast('No hay Client ID guardado. Usá "Configurar conexión nueva".','error');return;}
+  cerrarModal('modal-drive');
+  const scope='https://www.googleapis.com/auth/drive.file';
+  const redirectUri=window.location.href.split('#')[0];
+  window.location.href=`https://accounts.google.com/o/oauth2/v2/auth?client_id=${cid}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=token&scope=${encodeURIComponent(scope)}&prompt=none`;
+}
+
 function mostrarInstDrive(){document.getElementById('drive-inst').style.display='block';}
 
 function conectarDrive(){
