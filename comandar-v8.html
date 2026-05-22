@@ -1067,7 +1067,7 @@ let DB = {
   unidadesExtra:[],
   config:{emprendimiento:'PRELISTAS', margenDefault:40}
 };
-let driveToken=null, driveFileId=null, driveConnected=false;
+let driveToken=null, driveFileId=null, driveFolderId=null, driveConnected=false;
 let editRecetaId=null, pedidoActual={items:[]}, planifItems=[];
 let backupDriveTimer=null;
 
@@ -1089,7 +1089,10 @@ function toast(msg,tipo='success'){
   d.textContent=msg; document.getElementById('toast-container').appendChild(d);
   setTimeout(()=>d.remove(),3200);
 }
-function saveLocal(){localStorage.setItem('comandar_db',JSON.stringify(DB));}
+function saveLocal(){
+  localStorage.setItem('comandar_db',JSON.stringify(DB));
+  if(driveConnected&&driveToken) sincronizarDrive();
+}
 function loadLocal(){const d=localStorage.getItem('comandar_db');if(d){try{DB=JSON.parse(d);}catch(e){}}}
 
 // Convierte cantidades entre unidades para calcular costos correctamente
@@ -1528,29 +1531,44 @@ function guardarCompra(){
 
   const ticketBase64=document.getElementById('ticket-img').src.startsWith('data')?document.getElementById('ticket-img').src:null;
   const totalTicket=items.reduce((s,i)=>s+i.precio,0);
+  const compraId=uid();
 
-  // Actualizar precio (solo si sube) — el stock se recalcula desde cero
+  // Actualizar precio (solo si sube)
   items.forEach(it=>{
     const idx=DB.stock.findIndex(x=>x.id===it.selId);
     if(idx>=0){
       const s=DB.stock[idx];
       const cantConv=convertirUnidad(it.cant,it.unid,s.unidad);
       const precioUnitConv=cantConv?it.precio/cantConv:0;
-      if(precioUnitConv>(s.precioActual||0)){
-        DB.stock[idx].precioActual=precioUnitConv;
-      }
+      if(precioUnitConv>(s.precioActual||0)) DB.stock[idx].precioActual=precioUnitConv;
     }
   });
-  DB.compras.push({
-    id:uid(),
+
+  const compra={
+    id:compraId,
     fecha:document.getElementById('c-fecha').value,
     proveedor:document.getElementById('c-proveedor').value,
     items,totalTicket,ticketBase64,
     fechaReg:hoy()
-  });
+  };
+  DB.compras.push(compra);
   recalcularStock();
-  saveLocal();cerrarModal('modal-compra');renderStock();renderHistorial();
+  saveLocal();
+  cerrarModal('modal-compra');renderStock();renderHistorial();
   toast(`Compra de ${items.length} ítem/s registrada ✓`);
+
+  // Subir ticket a Drive en segundo plano
+  if(ticketBase64&&driveConnected&&driveToken){
+    const nombreTicket=`ticket-${compraId.substring(0,8)}.jpg`;
+    subirTicketDrive(ticketBase64, nombreTicket).then(fileId=>{
+      if(fileId){
+        // Guardar referencia del archivo en Drive
+        const idx=DB.compras.findIndex(c=>c.id===compraId);
+        if(idx>=0){DB.compras[idx].ticketDriveId=fileId;saveLocal();}
+        toast('📸 Ticket guardado en Drive ✓');
+      }
+    });
+  }
 }
 
 function abrirModalCostoFijo(id=null){
@@ -2237,53 +2255,206 @@ function procesarImport(input){
 }
 
 // Auto-backup local: si hay Drive conectado, sincroniza una vez al día
+// ================================================================
+// GOOGLE DRIVE — Sistema de carpetas
+// ================================================================
+const DRIVE_FOLDER_NAME = 'ComandAr — Prelistas';
+
+function abrirDriveModal(){abrirModal('modal-drive');}
+function mostrarInstDrive(){document.getElementById('drive-inst').style.display='block';}
+
+function conectarDrive(){
+  const cid=document.getElementById('drive-cid').value.trim();
+  if(!cid){toast('Ingresá el Client ID','error');return;}
+  // Guardar client ID para reutilizar
+  localStorage.setItem('comandar_client_id', cid);
+  const scope='https://www.googleapis.com/auth/drive.file';
+  const redirectUri=window.location.href.split('#')[0];
+  window.location.href=`https://accounts.google.com/o/oauth2/v2/auth?client_id=${cid}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=token&scope=${encodeURIComponent(scope)}`;
+}
+
+function setDriveStatus(estado){
+  const dot=document.getElementById('drive-dot');
+  const txt=document.getElementById('drive-status-text');
+  if(!dot||!txt)return;
+  dot.className='drive-dot';
+  if(estado==='connected'){dot.classList.add('connected');txt.textContent='Drive ✓';txt.style.color='#4CAF50';}
+  else if(estado==='syncing'){dot.classList.add('syncing');txt.textContent='Sincronizando...';}
+  else if(estado==='error'){txt.textContent='Error Drive';txt.style.color='var(--rojo)';}
+  else{txt.textContent='Drive';txt.style.color='';}
+}
+
+function checkDriveToken(){
+  const hash=window.location.hash;
+  if(hash.includes('access_token')){
+    const params=new URLSearchParams(hash.substring(1));
+    const token=params.get('access_token');
+    const expira=Date.now()+(parseInt(params.get('expires_in')||3600)*1000);
+    if(token){
+      driveToken=token;
+      driveConnected=true;
+      localStorage.setItem('comandar_drive_token', token);
+      localStorage.setItem('comandar_drive_expira', expira.toString());
+      window.history.replaceState({},document.title,window.location.pathname);
+      setDriveStatus('connected');
+      toast('✓ Google Drive conectado — configurando carpetas...');
+      iniciarSesionDrive();
+      return;
+    }
+  }
+  // Intentar recuperar token guardado
+  const tokenGuardado=localStorage.getItem('comandar_drive_token');
+  const expira=parseInt(localStorage.getItem('comandar_drive_expira')||'0');
+  if(tokenGuardado && Date.now() < expira){
+    driveToken=tokenGuardado;
+    driveConnected=true;
+    setDriveStatus('connected');
+    iniciarSesionDrive();
+  }
+}
+
+// Buscar o crear carpeta por nombre dentro de un padre
+async function obtenerOCrearCarpeta(nombre, padreId=null){
+  const q=padreId
+    ? `name='${nombre}' and mimeType='application/vnd.google-apps.folder' and '${padreId}' in parents and trashed=false`
+    : `name='${nombre}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const res=await driveGet(`files?q=${encodeURIComponent(q)}&fields=files(id,name)`);
+  if(res.files&&res.files.length) return res.files[0].id;
+  // Crear carpeta
+  const meta={name:nombre, mimeType:'application/vnd.google-apps.folder'};
+  if(padreId) meta.parents=[padreId];
+  const nueva=await drivePost('files', meta);
+  return nueva.id;
+}
+
+// Obtener o crear carpeta del mes actual (ej: "2026-05")
+async function obtenerCarpetaMes(){
+  const mes=hoy().substring(0,7);
+  return await obtenerOCrearCarpeta(mes, driveFolderId);
+}
+
+// Iniciar sesión: crear estructura de carpetas y cargar datos
+async function iniciarSesionDrive(){
+  try{
+    setDriveStatus('syncing');
+    // 1. Carpeta principal
+    driveFolderId=await obtenerOCrearCarpeta(DRIVE_FOLDER_NAME);
+    localStorage.setItem('comandar_drive_folder_id', driveFolderId);
+    // 2. Buscar archivo de datos
+    const q=`name='comandar-datos.json' and '${driveFolderId}' in parents and trashed=false`;
+    const res=await driveGet(`files?q=${encodeURIComponent(q)}&fields=files(id,name)`);
+    if(res.files&&res.files.length){
+      driveFileId=res.files[0].id;
+      // Cargar datos desde Drive
+      const contenido=await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`,
+        {headers:{Authorization:'Bearer '+driveToken}}).then(r=>r.json());
+      if(contenido&&contenido.recetas!==undefined){
+        DB=contenido;
+        if(!DB.notitas)DB.notitas=[];
+        if(!DB.movimientos)DB.movimientos=[];
+        if(!DB.cierres)DB.cierres=[];
+        if(!DB.histIngredientes)DB.histIngredientes=[];
+        saveLocal();
+        recalcularStock();
+        renderRecetas();
+        renderCalendario();
+        renderItemsPedido();
+        toast('✓ Datos cargados desde Drive');
+      }
+    }
+    setDriveStatus('connected');
+    localStorage.setItem('comandar_last_sync', hoy());
+  }catch(e){
+    console.error('Drive init error:', e);
+    setDriveStatus('error');
+    toast('Error al conectar con Drive. Usando datos locales.', 'warn');
+  }
+}
+
+// Guardar datos JSON en carpeta principal
+async function sincronizarDrive(){
+  if(!driveToken||!driveConnected)return;
+  setDriveStatus('syncing');
+  try{
+    if(!driveFolderId) driveFolderId=localStorage.getItem('comandar_drive_folder_id')||null;
+    if(!driveFolderId) driveFolderId=await obtenerOCrearCarpeta(DRIVE_FOLDER_NAME);
+    const data=JSON.stringify(DB);
+    if(driveFileId){
+      await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`,
+        {method:'PATCH', headers:{Authorization:'Bearer '+driveToken,'Content-Type':'application/json'}, body:data});
+    }else{
+      const boundary='cmdrbnd';
+      const body=`--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify({name:'comandar-datos.json',mimeType:'application/json',parents:[driveFolderId]})}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${data}\r\n--${boundary}--`;
+      const res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+        {method:'POST', headers:{Authorization:'Bearer '+driveToken,'Content-Type':'multipart/related; boundary='+boundary}, body}).then(r=>r.json());
+      driveFileId=res.id;
+    }
+    setDriveStatus('connected');
+    localStorage.setItem('comandar_last_sync', hoy());
+  }catch(e){
+    console.error('Sync error:',e);
+    setDriveStatus('error');
+  }
+}
+
+// Subir foto de ticket a carpeta del mes
+async function subirTicketDrive(base64, nombreArchivo){
+  if(!driveToken||!driveConnected)return null;
+  try{
+    if(!driveFolderId) driveFolderId=await obtenerOCrearCarpeta(DRIVE_FOLDER_NAME);
+    const carpetaMesId=await obtenerCarpetaMes();
+    // Convertir base64 a blob
+    const arr=base64.split(',');const mime=arr[0].match(/:(.*?);/)[1];
+    const bstr=atob(arr[1]);let n=bstr.length;const u8=new Uint8Array(n);
+    while(n--){u8[n]=bstr.charCodeAt(n);}
+    const blob=new Blob([u8],{type:mime});
+    const boundary='ticketbnd';
+    const metaStr=JSON.stringify({name:nombreArchivo,mimeType:mime,parents:[carpetaMesId]});
+    // Multipart upload
+    const formData=new FormData();
+    formData.append('metadata',new Blob([metaStr],{type:'application/json'}));
+    formData.append('file',blob);
+    const res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+      {method:'POST', headers:{Authorization:'Bearer '+driveToken}, body:formData}).then(r=>r.json());
+    return res.id;
+  }catch(e){console.error('Error subiendo ticket:', e);return null;}
+}
+
+// Subir PDF de cierre a carpeta del mes
+async function subirCierrePDFDrive(htmlContent, periodo){
+  if(!driveToken||!driveConnected)return;
+  try{
+    if(!driveFolderId) driveFolderId=await obtenerOCrearCarpeta(DRIVE_FOLDER_NAME);
+    const carpetaMesId=await obtenerOCrearCarpeta(periodo, driveFolderId);
+    const nombre=`cierre-${periodo}.html`;
+    const boundary='cierrebnd';
+    const meta=JSON.stringify({name:nombre,mimeType:'text/html',parents:[carpetaMesId]});
+    const body=`--${boundary}\r\nContent-Type: application/json\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: text/html\r\n\r\n${htmlContent}\r\n--${boundary}--`;
+    await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+      {method:'POST', headers:{Authorization:'Bearer '+driveToken,'Content-Type':'multipart/related; boundary='+boundary}, body}).then(r=>r.json());
+    toast(`✓ Cierre ${periodo} guardado en Drive`);
+  }catch(e){console.error('Error subiendo cierre:', e);}
+}
+
+// Helpers API Drive
+async function driveGet(path){
+  const r=await fetch(`https://www.googleapis.com/drive/v3/${path}`,{headers:{Authorization:'Bearer '+driveToken}});
+  return r.json();
+}
+async function drivePost(path, body){
+  const r=await fetch(`https://www.googleapis.com/drive/v3/${path}`,
+    {method:'POST', headers:{Authorization:'Bearer '+driveToken,'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return r.json();
+}
+
 function checkAutoBackupDrive(){
   const ultimaSync=localStorage.getItem('comandar_last_sync');
   const hoyStr=hoy();
   if(driveConnected&&driveToken&&ultimaSync!==hoyStr){
     sincronizarDrive();
-    localStorage.setItem('comandar_last_sync',hoyStr);
   }
 }
 
-// ================================================================
-// GOOGLE DRIVE
-// ================================================================
-function abrirDriveModal(){abrirModal('modal-drive');}
-function mostrarInstDrive(){document.getElementById('drive-inst').style.display='block';}
-function conectarDrive(){
-  const cid=document.getElementById('drive-cid').value.trim();
-  if(!cid){toast('Ingresá el Client ID','error');return;}
-  const scope='https://www.googleapis.com/auth/drive.file';
-  window.location.href=`https://accounts.google.com/o/oauth2/v2/auth?client_id=${cid}&redirect_uri=${encodeURIComponent(window.location.href.split('#')[0])}&response_type=token&scope=${encodeURIComponent(scope)}`;
-}
-function checkDriveToken(){
-  const hash=window.location.hash;
-  if(hash.includes('access_token')){
-    const params=new URLSearchParams(hash.substring(1));
-    driveToken=params.get('access_token');
-    if(driveToken){driveConnected=true;document.getElementById('drive-dot').classList.add('connected');document.getElementById('drive-status-text').textContent='Drive ✓';window.history.replaceState({},document.title,window.location.pathname);toast('Google Drive conectado ✓');sincronizarDrive();}
-  }
-}
-async function sincronizarDrive(){
-  if(!driveToken)return;
-  document.getElementById('drive-dot').className='drive-dot syncing';
-  try{
-    const data=JSON.stringify(DB);const nombre='comandar-prelistas.json';
-    if(!driveFileId){
-      const meta=await fetch(`https://www.googleapis.com/drive/v3/files?q=name='${nombre}'&fields=files(id)`,{headers:{Authorization:'Bearer '+driveToken}}).then(r=>r.json());
-      if(meta.files&&meta.files.length)driveFileId=meta.files[0].id;
-    }
-    if(driveFileId){
-      await fetch(`https://www.googleapis.com/upload/drive/v3/files/${driveFileId}?uploadType=media`,{method:'PATCH',headers:{Authorization:'Bearer '+driveToken,'Content-Type':'application/json'},body:data});
-    }else{
-      const res=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',{method:'POST',headers:{Authorization:'Bearer '+driveToken,'Content-Type':'multipart/related; boundary=b123'},body:`--b123\r\nContent-Type: application/json\r\n\r\n{"name":"${nombre}","mimeType":"application/json"}\r\n--b123\r\nContent-Type: application/json\r\n\r\n${data}\r\n--b123--`}).then(r=>r.json());
-      driveFileId=res.id;
-    }
-    document.getElementById('drive-dot').className='drive-dot connected';
-    localStorage.setItem('comandar_last_sync',hoy());
-  }catch(e){document.getElementById('drive-dot').className='drive-dot';document.getElementById('drive-status-text').textContent='Sync error';}
-}
 
 // ================================================================
 // MOVIMIENTOS Y CIERRES MENSUALES
@@ -2348,12 +2519,13 @@ function cerrarMesManual(){
   const compMes=DB.compras.filter(c=>c.fecha.startsWith(periodo)).reduce((s,c)=>s+c.totalTicket,0);
   const gastMes=DB.gastos.filter(g=>g.fecha.startsWith(periodo)).reduce((s,g)=>s+g.monto,0);
   const egresos=compMes+gastMes;
+  const ganancia=ingresos-egresos;
   const snapIng=calcSnapshotIngredientes(periodo);
 
   if(!DB.cierres)DB.cierres=[];
   if(!DB.histIngredientes)DB.histIngredientes=[];
 
-  DB.cierres.push({id:uid(),periodo,fechaCierre:hoy(),ingresos,egresos,ganancia:ingresos-egresos,cantPedidos:pedMes.length,cajas:{...DB.cajas}});
+  DB.cierres.push({id:uid(),periodo,fechaCierre:hoy(),ingresos,egresos,ganancia,cantPedidos:pedMes.length,cajas:{...DB.cajas}});
   DB.histIngredientes.push({periodo,items:snapIng});
 
   saveLocal();
@@ -2361,7 +2533,62 @@ function cerrarMesManual(){
   renderMovimientos();
   renderIngHist();
   toast(`✓ Cierre de ${nombreMes} guardado en el historial`);
+
+  // Generar y subir resumen HTML a Drive
+  if(driveConnected&&driveToken){
+    const htmlCierre=generarHTMLCierre(periodo,nombreMes,{ingresos,egresos,ganancia,cantPedidos:pedMes.length},pedMes,DB.compras.filter(c=>c.fecha.startsWith(periodo)),DB.gastos.filter(g=>g.fecha.startsWith(periodo)),snapIng);
+    subirCierrePDFDrive(htmlCierre, periodo);
+  }
 }
+
+function generarHTMLCierre(periodo,nombreMes,resumen,pedidos,compras,gastos,snapIng){
+  return`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Cierre ${nombreMes} — PRELISTAS</title>
+  <style>body{font-family:Arial,sans-serif;padding:32px;color:#222;max-width:900px;margin:0 auto;}
+  h1{font-size:28px;color:#E8621A;margin-bottom:4px;}h2{font-size:16px;color:#C04E0E;margin-top:24px;border-bottom:2px solid #E8621A;padding-bottom:4px;}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:16px 0;}
+  .metric{background:#FAF6F0;border-radius:8px;padding:14px;text-align:center;}
+  .metric-label{font-size:11px;color:#6B5A50;text-transform:uppercase;font-weight:600;}
+  .metric-val{font-size:24px;font-weight:700;margin-top:4px;}
+  table{width:100%;border-collapse:collapse;margin-top:8px;}
+  th{background:#2A2420;color:#fff;padding:8px 10px;text-align:left;font-size:12px;}
+  td{padding:7px 10px;border-bottom:1px solid #F0E8DC;font-size:13px;}
+  .verde{color:#2D7A45;}.rojo{color:#C0392B;}.naranja{color:#E8621A;}
+  .ing-bar-wrap{height:8px;background:#F0E8DC;border-radius:4px;margin-top:4px;}
+  .ing-bar{height:100%;border-radius:4px;}
+  </style></head><body>
+  <h1>📊 Cierre mensual — PRELISTAS</h1>
+  <p style="color:#6B5A50;font-size:13px;">Período: <strong>${nombreMes}</strong> · Generado el ${hoy()}</p>
+  <div class="grid">
+    <div class="metric"><div class="metric-label">Ingresos</div><div class="metric-val verde">${fp(resumen.ingresos)}</div></div>
+    <div class="metric"><div class="metric-label">Egresos</div><div class="metric-val rojo">${fp(resumen.egresos)}</div></div>
+    <div class="metric"><div class="metric-label">Ganancia neta</div><div class="metric-val ${resumen.ganancia>=0?'naranja':'rojo'}">${fp(resumen.ganancia)}</div></div>
+  </div>
+  <h2>Pedidos cobrados (${resumen.cantPedidos})</h2>
+  <table><thead><tr><th>Fecha</th><th>Cliente</th><th>Total</th><th>Pago</th></tr></thead><tbody>
+  ${pedidos.map(p=>`<tr><td>${p.fecha}</td><td>${p.clienteNombre}</td><td class="verde">${fp(p.total)}</td><td>${p.formaPago}</td></tr>`).join('')}
+  </tbody></table>
+  <h2>Compras realizadas</h2>
+  <table><thead><tr><th>Fecha</th><th>Proveedor</th><th>Total</th></tr></thead><tbody>
+  ${compras.map(c=>`<tr><td>${c.fecha}</td><td>${c.proveedor||'—'}</td><td class="rojo">${fp(c.totalTicket)}</td></tr>`).join('')}
+  </tbody></table>
+  <h2>Gastos extras</h2>
+  <table><thead><tr><th>Fecha</th><th>Concepto</th><th>Categoría</th><th>Monto</th></tr></thead><tbody>
+  ${gastos.map(g=>`<tr><td>${g.fecha}</td><td>${g.concepto}</td><td>${g.cat||'otro'}</td><td class="rojo">${fp(g.monto)}</td></tr>`).join('')}
+  ${!gastos.length?'<tr><td colspan="4" style="color:#B8A898;text-align:center;">Sin gastos registrados</td></tr>':''}
+  </tbody></table>
+  <h2>Uso de ingredientes</h2>
+  ${snapIng.filter(i=>i.comprado>0||i.usado>0).map(i=>{
+    const pct=i.comprado>0?Math.min(130,i.usado/i.comprado*100):0;
+    const color=pct>100?'#C0392B':pct>80?'#D4A017':'#2D7A45';
+    return`<div style="margin-bottom:10px;">
+      <div style="display:flex;justify-content:space-between;font-size:13px;"><span><strong>${i.nombre}</strong></span><span style="color:#6B5A50;">${i.usado.toFixed(1)} usado / ${i.comprado.toFixed(1)} comprado ${i.unidad}</span></div>
+      <div class="ing-bar-wrap"><div class="ing-bar" style="width:${Math.min(100,pct)}%;background:${color};"></div></div>
+    </div>`;
+  }).join('')}
+  <div style="margin-top:32px;padding-top:16px;border-top:1px solid #F0E8DC;font-size:11px;color:#B8A898;text-align:center;">ComandAr by Franco Ferrante · PRELISTAS · ${periodo}</div>
+  </body></html>`;
+}
+
 
 function calcSnapshotIngredientes(periodo){
   const snap={};
@@ -2720,35 +2947,37 @@ function renderNotitas(){
 // ================================================================
 function init(){
   loadLocal();
-  checkDriveToken();
+  checkDriveToken(); // Recupera token guardado o procesa redirect OAuth
+
   document.querySelectorAll('input[type=date]').forEach(f=>{if(!f.value)f.value=hoy();});
   const empNombre=(DB.config&&DB.config.emprendimiento)||'PRELISTAS';
   const headerEmp=document.getElementById('header-emp-nombre');
   if(headerEmp)headerEmp.textContent=empNombre.toUpperCase();
 
-  // Inicializar arrays que pueden faltar en datos viejos
+  // Restaurar folder ID guardado
+  const savedFolder=localStorage.getItem('comandar_drive_folder_id');
+  if(savedFolder) driveFolderId=savedFolder;
+
+  // Inicializar arrays que pueden faltar
   if(!DB.notitas)DB.notitas=[];
   if(!DB.movimientos)DB.movimientos=[];
   if(!DB.cierres)DB.cierres=[];
   if(!DB.histIngredientes)DB.histIngredientes=[];
 
-  // Recalcular stock desde fuente de verdad
   recalcularStock();
-
-  // Verificar si hay que hacer cierre automático del mes anterior
   checkAutoCierre();
-
   renderRecetas();
   renderCalendario();
   renderItemsPedido();
 
-  if(localStorage.getItem('comandar_db')){
-    document.getElementById('drive-status-text').textContent='Guardado local';
-    document.getElementById('drive-dot').classList.add('connected');
+  // Si hay datos locales pero no Drive conectado, mostrar estado local
+  if(localStorage.getItem('comandar_db')&&!driveConnected){
+    setDriveStatus('local');
+    document.getElementById('drive-status-text').textContent='Local';
   }
+
   checkAutoBackupDrive();
   setInterval(checkAutoBackupDrive,3600000);
-  // Chequear cierre automático cada hora
   setInterval(checkAutoCierre,3600000);
 }
 document.addEventListener('DOMContentLoaded',init);
